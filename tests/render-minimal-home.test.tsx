@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import React from "react";
 import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
 import { KnowledgeSummary } from "../components/minimal-home.tsx";
 
 function render(props: Partial<Parameters<typeof KnowledgeSummary>[0]> = {}) {
@@ -71,5 +72,18 @@ describe("KnowledgeSummary — the quiet home summary (2026-10-06)", () => {
 	it("non-empty shows no empty-state hint", () => {
 		const html = render();
 		assert.ok(!html.includes("Nothing here yet"));
+	});
+});
+
+// No SSR seam for MinimalHome itself, so a source pin (PDFs + images
+// through "Import notes…", owner, 2026-11-02): the picker reads the shared
+// accept list + hint from src/core, never a stale literal.
+describe("MinimalHome import picker — shared accept + hint (2026-11-02)", () => {
+	it("references NOTES_IMPORT_ACCEPT and NOTES_IMPORT_HINT, no literal accept list", () => {
+		const source = readFileSync(new URL("../components/minimal-home.tsx", import.meta.url), "utf8");
+		assert.ok(source.includes("accept={NOTES_IMPORT_ACCEPT}"));
+		assert.ok(source.includes("label={NOTES_IMPORT_HINT}"));
+		assert.ok(source.includes('data-testid="import-notes"'));
+		assert.ok(!source.includes(".md,.markdown,.txt"), "no hard-coded accept list");
 	});
 });

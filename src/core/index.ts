@@ -80,3 +80,7 @@ export * from "./coverage.ts";
 // ONE session→markdown formatter — the extractor's view and the user-facing
 // export share it. Pure, browser-safe.
 export * from "./session-markdown.ts";
+// source-import.ts (PDFs + images through "Import notes…", owner
+// 2026-11-02): the binary front door's shared limits, accept list, hint
+// and error wording — the client precheck and the server share it. Pure.
+export * from "./source-import.ts";

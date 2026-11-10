@@ -198,3 +198,95 @@ it("actual attempts clear errors immediately, guard synchronous reentry, preserv
 	assert.equal(finishes, 3);
 	assert.equal(host!.innerHTML, "");
 });
+
+// Binary sources (PDFs + images, owner, 2026-11-02): client prechecks reject
+// doomed files before upload, in the shared server wording; only accepted
+// files are posted and server rows map back to the ORIGINAL selection order.
+const sized = (name: string, size: number) => {
+	const file = new File(["x"], name);
+	Object.defineProperty(file, "size", { value: size }); // no real allocation
+	return file;
+};
+const fakePdf = (count: number) => new File([`%PDF-1.4\n1 0 obj\n<< /Type /Pages /Kids [] /Count ${count} >>\nendobj\n%%EOF`], "big.pdf");
+const UNSUPPORTED = "Unsupported file type. Import notes (.md, .txt), PDFs, or images (.png, .jpg).";
+const TOO_LARGE = "File is too large (over 25 MB).";
+const SELECTION = "Selection is too large to import at once (over 100 MB). Import fewer files at a time.";
+
+it("precheckSourceFile: extension, per-file size, PDF page hint", async () => {
+	const { precheckSourceFile } = await import("../components/notes-import.tsx");
+	assert.equal(await precheckSourceFile(new File(["x"], "page.html")), UNSUPPORTED);
+	assert.equal(await precheckSourceFile(new File(["x"], "README")), UNSUPPORTED);
+	assert.equal(await precheckSourceFile(sized("huge.png", 25 * 1024 * 1024 + 1)), TOO_LARGE);
+	assert.equal(await precheckSourceFile(sized("edge.jpg", 25 * 1024 * 1024)), null);
+	assert.equal(await precheckSourceFile(fakePdf(101)), "PDF has 101 pages; the limit is 100.");
+	assert.equal(await precheckSourceFile(fakePdf(100)), null);
+	assert.equal(await precheckSourceFile(new File(["%PDF-1.4 no page tree visible"], "opaque.pdf")), null, "no hint → the server decides");
+	assert.equal(await precheckSourceFile(new File(["notes"], "NOTES.MD")), null);
+});
+
+it("rejected files are never posted; FormData holds only accepted files; rows map back to selection order", async () => {
+	const selected = [
+		new File(["bad"], "page.html"), // 0: unsupported
+		new File(["ok"], "ok.md"), // 1: accepted → request 0, succeeds
+		sized("huge.png", 26 * 1024 * 1024), // 2: too large
+		new File(["fails"], "fails.txt"), // 3: accepted → request 1, server failure
+		fakePdf(101), // 4: too many pages
+		new File(["%PDF"], "late.pdf"), // 5: accepted → request 2, server failure
+	];
+	let posted: string[] = [];
+	let requests = 0;
+	globalThis.fetch = async (_url, init) => {
+		requests++;
+		posted = ((init?.body as FormData).getAll("files") as File[]).map((f) => f.name);
+		return Response.json({ results: [
+			{ requestIndex: 2, filePath: "late.pdf", ok: false, outcome: "failed", error: "This file is not a valid PDF." },
+			{ requestIndex: 0, filePath: "ok.md", ok: true, outcome: "completed", stats: { nodes: 1 } },
+			{ requestIndex: 1, filePath: "fails.txt", ok: false, outcome: "failed", error: "No key is set", code: "provider_key_missing", provider: "openai", slots: ["cheap"] },
+		] });
+	};
+	await mount();
+	await submit(selected);
+	assert.equal(requests, 1);
+	assert.deepEqual(posted, ["ok.md", "fails.txt", "late.pdf"]);
+	assert.deepEqual(current.errors, [
+		`page.html: ${UNSUPPORTED}`,
+		`huge.png: ${TOO_LARGE}`,
+		"fails.txt: No key is set\nprovider_key_missing — openai — cheap",
+		"big.pdf: PDF has 101 pages; the limit is 100.",
+		"late.pdf: This file is not a valid PDF.",
+	]);
+	assert.equal(starts, 1);
+	assert.equal(finishes, 1);
+});
+
+it("everything rejected: no fetch, but onStart/onFinish still fire and errors show", async () => {
+	let requests = 0;
+	globalThis.fetch = async () => { requests++; return Response.json({ results: [] }); };
+	await mount();
+	await submit([new File(["x"], "a.docx"), sized("b.md", 30 * 1024 * 1024), fakePdf(500)]);
+	assert.equal(requests, 0);
+	assert.deepEqual(current.errors, [`a.docx: ${UNSUPPORTED}`, `b.md: ${TOO_LARGE}`, "big.pdf: PDF has 500 pages; the limit is 100."]);
+	assert.equal(starts, 1);
+	assert.equal(finishes, 1);
+	assert.equal(current.importing, false);
+	assert.equal(host!.querySelectorAll('[role="alert"]').length, 3);
+});
+
+it("accepted total over 100 MB: every accepted file gets the selection message, nothing is posted", async () => {
+	let requests = 0;
+	globalThis.fetch = async () => { requests++; return Response.json({ results: [] }); };
+	await mount();
+	const big = [0, 1, 2, 3, 4].map((i) => sized(`part${i}.pdf`, 21 * 1024 * 1024));
+	for (const file of big) Object.defineProperty(file, "arrayBuffer", { value: async () => new ArrayBuffer(0) });
+	await submit([new File(["x"], "skip.zip"), ...big]);
+	assert.equal(requests, 0);
+	assert.deepEqual(current.errors, [`skip.zip: ${UNSUPPORTED}`, ...big.map((f) => `${f.name}: ${SELECTION}`)]);
+	assert.equal(finishes, 1);
+});
+
+it("transport failure applies to accepted files only, keeping precheck errors in selection order", async () => {
+	globalThis.fetch = async () => { throw new Error("synthetic offline"); };
+	await mount();
+	await submit([new File(["a"], "a.md"), new File(["x"], "b.exe"), new File(["c"], "c.txt")]);
+	assert.deepEqual(current.errors, ["a.md: synthetic offline", `b.exe: ${UNSUPPORTED}`, "c.txt: synthetic offline"]);
+});

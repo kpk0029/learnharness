@@ -1,6 +1,33 @@
 "use client";
 
+/**
+ * NOTES IMPORT — the "Import notes…" transport + hook shared by both
+ * mounts (graph view, minimal home): one POST of the selected files to
+ * /api/graph/import, failures only, as plain `<file>: <message>` alerts.
+ *
+ * Binary sources (PDFs + images, owner, 2026-11-02): before anything is
+ * uploaded every selected file is prechecked here — extension, the 25 MB
+ * per-file cap, and a best-effort PDF page count (> 100 pages) — with the
+ * wording shared with the server through src/core/source-import.ts. Only
+ * accepted files are posted, and only when their total stays under the
+ * 100 MB request cap (otherwise each accepted file reports the selection
+ * message and nothing is sent). Server rows map back to the ORIGINAL
+ * selection order, interleaved with precheck errors. The server's checks
+ * stay authoritative; these only spare a doomed upload.
+ */
+
 import { useRef, useState } from "react";
+import {
+	MAX_IMPORT_REQUEST_BYTES,
+	MAX_PDF_PAGES,
+	MAX_SOURCE_BYTES,
+	pdfPageCountHint,
+	selectionTooLargeMessage,
+	sourceKindFromName,
+	sourceTooLargeMessage,
+	tooManyPagesMessage,
+	unsupportedTypeMessage,
+} from "@/src/core";
 
 // Transport-only types: never import the server's extraction/agent module here.
 export interface NotesImportResult {
@@ -51,6 +78,18 @@ export async function postNotesImport(files: readonly File[]): Promise<NotesImpo
 	return parseNotesImportResults(body, files);
 }
 
+/** Client-side rejection message for one selected file, or null to upload it. */
+export async function precheckSourceFile(file: File): Promise<string | null> {
+	const kind = sourceKindFromName(file.name);
+	if (kind === null) return unsupportedTypeMessage();
+	if (file.size > MAX_SOURCE_BYTES) return sourceTooLargeMessage();
+	if (kind === "pdf") {
+		const pages = pdfPageCountHint(new Uint8Array(await file.arrayBuffer()));
+		if (pages !== null && pages > MAX_PDF_PAGES) return tooManyPagesMessage(pages);
+	}
+	return null;
+}
+
 /** Only error text survives a request; selected Files stay request-local. */
 export function useNotesImport(callbacks: { onStart?: () => void; onFinish?: () => void } = {}) {
 	const [errors, setErrors] = useState<string[]>([]);
@@ -61,16 +100,32 @@ export function useNotesImport(callbacks: { onStart?: () => void; onFinish?: () 
 		pending.current = true;
 		setImporting(true);
 		setErrors([]);
+		// Selection-order error rows: precheck rejections + server failures.
+		const rows: { index: number; text: string }[] = [];
+		let accepted = files.map((file, index) => ({ file, index }));
 		try {
 			callbacks.onStart?.();
-			const results = await postNotesImport(files);
-			setErrors(results
-				.filter((result) => !result.ok)
-				.sort((a, b) => a.requestIndex - b.requestIndex)
-				.map((r) => `${r.filePath}: ${r.error}${r.code ? `\n${r.code}${r.provider ? ` — ${r.provider}` : ""}${r.missing?.length ? ` — ${r.missing.join(", ")}` : ""}${r.slots?.length ? ` — ${r.slots.join(", ")}` : ""}` : ""}`));
+			const checks = await Promise.all(files.map((file) => precheckSourceFile(file)));
+			accepted = [];
+			checks.forEach((message, index) => {
+				if (message === null) accepted.push({ file: files[index]!, index });
+				else rows.push({ index, text: `${files[index]!.name}: ${message}` });
+			});
+			if (accepted.reduce((total, { file }) => total + file.size, 0) > MAX_IMPORT_REQUEST_BYTES) {
+				for (const { file, index } of accepted) rows.push({ index, text: `${file.name}: ${selectionTooLargeMessage()}` });
+			} else if (accepted.length > 0) {
+				const results = await postNotesImport(accepted.map(({ file }) => file));
+				for (const r of results) if (!r.ok) rows.push({
+					index: accepted[r.requestIndex]!.index,
+					text: `${r.filePath}: ${r.error}${r.code ? `\n${r.code}${r.provider ? ` — ${r.provider}` : ""}${r.missing?.length ? ` — ${r.missing.join(", ")}` : ""}${r.slots?.length ? ` — ${r.slots.join(", ")}` : ""}` : ""}`,
+				});
+			}
+			setErrors(rows.sort((a, b) => a.index - b.index).map((row) => row.text));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			setErrors(files.map((file) => `${file.name}: ${message}`));
+			// Transport failures apply to the files actually sent; precheck errors stay.
+			for (const { file, index } of accepted) rows.push({ index, text: `${file.name}: ${message}` });
+			setErrors(rows.sort((a, b) => a.index - b.index).map((row) => row.text));
 		} finally {
 			pending.current = false;
 			setImporting(false);

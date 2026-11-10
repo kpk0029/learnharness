@@ -24,7 +24,7 @@ import { ChainTableOverlay } from "@/components/chain-table.tsx";
 import { GraphCostControl } from "@/components/graph-view.tsx";
 import { NotesImportErrors, useNotesImport } from "@/components/notes-import.tsx";
 import { Hint } from "@/components/ui/hint";
-import type { ChatSummary, GraphCostSummary, GraphSnapshot } from "@/src/core";
+import { NOTES_IMPORT_ACCEPT, NOTES_IMPORT_HINT, type ChatSummary, type GraphCostSummary, type GraphSnapshot } from "@/src/core";
 
 /** The quiet centered summary — a pure body (props in, markup out) so
  * the render suite can pin it statically. Very quiet by owner ruling:
@@ -136,7 +136,7 @@ export function MinimalHome({
 				ref={fileInputRef}
 				type="file"
 				multiple
-				accept=".md,.markdown,.txt"
+				accept={NOTES_IMPORT_ACCEPT}
 				className="hidden"
 				onChange={(e) => {
 					onImportFiles(e.target.files);
@@ -180,7 +180,7 @@ export function MinimalHome({
 						</Hint>
 					</div>
 					<div className="shrink-0 rounded-xl border bg-card/85 px-1 py-[3px] shadow-lg backdrop-blur">
-						<Hint label="Import notes into the graph" side="bottom">
+						<Hint label={NOTES_IMPORT_HINT} side="bottom">
 							<button
 								type="button"
 								disabled={importing}

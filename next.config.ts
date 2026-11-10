@@ -98,6 +98,14 @@ const nextConfig: NextConfig = {
 			"node_modules/bignumber.js/**/*",
 		],
 	},
+	// Import body limit (PDFs + images through "Import notes…", owner
+	// 2026-11-02): proxy.ts matches /api/:path*, and Next buffers every
+	// proxied request body — truncating SILENTLY at the 10 MB default (no
+	// error, the route just sees a cut-off multipart body). 101 MiB =
+	// MAX_IMPORT_REQUEST_BYTES (src/core/source-import.ts, 100 MiB) + 1 MiB
+	// multipart headroom. Written as a literal: importing src/core from the
+	// config is a loader risk. tests/source-import.test.ts pins the pair.
+	experimental: { proxyClientMaxBodySize: 101 * 1024 * 1024 },
 	// Framework-free core lives in src/ (plain TS, imported by routes and CLI alike).
 	// The pi engine must stay external: its providers are runtime-loaded Node
 	// code (undici streams, catalog data) that breaks when bundled into routes.
