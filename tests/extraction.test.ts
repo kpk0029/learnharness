@@ -62,6 +62,7 @@ import { coverageOf, coverageSlots, messageViewLines } from "../src/core/coverag
 import { chatStore } from "../src/store/chats.ts";
 import { subscribe } from "../src/core/events.ts";
 import { PATHS } from "../config.ts";
+import { makePdf } from "./fixtures/make-pdf.ts";
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -2524,5 +2525,240 @@ describe("notes import completion and retry reliability", () => {
 		assert.equal(ledgers.readSources().length, 1);
 		assert.equal(ledgers.readSources()[0]!.extractions?.length, 2);
 		assert.equal(ledgers.readNodes().length, 2);
+	});
+});
+
+// ─── the binary front door (importSource, owner 2026-11-02) ─────────────────
+
+const PNG_1PX = Buffer.from([
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+	0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+	0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+	0x42, 0x60, 0x82,
+]);
+
+describe("importSource (binary front door)", () => {
+	const TRANSCRIPTION = "# Photographed page\n\nVim always starts in Normal mode — keys are commands.";
+	const srcIdOf = (filePath: string) => `src_${createHash("sha256").update(filePath).digest("hex").slice(0, 12)}`;
+	/** A faux transcriber: answers TRANSCRIPTION; counts calls. */
+	const transcriberModel = (onCall?: () => void) =>
+		fauxEngine([() => { onCall?.(); return fauxAssistantMessage(TRANSCRIPTION); }]);
+	const counted = () => {
+		const calls = { extractor: 0, auditor: 0, transcriber: 0 };
+		return {
+			calls,
+			extractor: submitModel("submit_findings", NOTES_FINDINGS, () => { calls.extractor++; }),
+			auditor: submitModel("submit_review", NOTES_VERDICT, () => { calls.auditor++; }),
+			transcriber: transcriberModel(() => { calls.transcriber++; }),
+		};
+	};
+	const incomplete = (outcome: NotesImportError["outcome"]) => (error: unknown) => {
+		assert.ok(error instanceof NotesImportError, String(error));
+		assert.equal(error.outcome, outcome);
+		return true;
+	};
+
+	it("text bytes (with a UTF-8 BOM) give the same result as importNotes", async () => {
+		const views: string[] = [];
+		const extractor = () => fauxEngine([(context) => {
+			views.push(capturedView(context));
+			return fauxAssistantMessage([fauxToolCall("submit_findings", NOTES_FINDINGS as unknown as ToolCall["arguments"])], { stopReason: "toolUse" });
+		}]);
+		const a = memoryLedgers();
+		const b = memoryLedgers();
+		const viaNotes = await createExtractionPipeline({ chatStore, graphStore: a, extractor: extractor(), auditor: submitModel("submit_review", NOTES_VERDICT) })
+			.importNotes({ filePath: "/vault/bom.md", text: NOTES_TEXT });
+		const bytes = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(NOTES_TEXT)]);
+		const viaSource = await createExtractionPipeline({ chatStore, graphStore: b, extractor: extractor(), auditor: submitModel("submit_review", NOTES_VERDICT) })
+			.importSource({ filePath: "/vault/bom.md", bytes });
+		assert.deepEqual(viaSource, viaNotes);
+		assert.equal(views.length, 2);
+		assert.equal(views[1], views[0], "the BOM is stripped — the extractor sees identical text");
+		assert.ok(!views[1]!.includes("﻿"));
+		assert.equal(b.readSources()[0]!.id, a.readSources()[0]!.id);
+		assert.equal(b.readSources()[0]!.extractions?.length, 1, "no transcription record for text");
+	});
+
+	it("a PNG transcribes, then runs the notes pipeline over the transcription", async () => {
+		const ledgers = memoryLedgers();
+		const views: string[] = [];
+		const phases: string[] = [];
+		const id = srcIdOf("/vault/photo.png");
+		const off = subscribe((e) => {
+			if (e.type !== "activity-changed") return;
+			const phase = extractionStatuses().find((r) => r.chatId === id)?.phase;
+			if (phase && phases[phases.length - 1] !== phase) phases.push(phase);
+		});
+		let transcriberCalls = 0;
+		const pipeline = createExtractionPipeline({
+			chatStore, graphStore: ledgers,
+			transcriber: transcriberModel(() => { transcriberCalls++; }),
+			extractor: fauxEngine([(context) => {
+				views.push(capturedView(context));
+				return fauxAssistantMessage([fauxToolCall("submit_findings", NOTES_FINDINGS as unknown as ToolCall["arguments"])], { stopReason: "toolUse" });
+			}]),
+			auditor: submitModel("submit_review", NOTES_VERDICT),
+		});
+		let stats;
+		try {
+			stats = await pipeline.importSource({ filePath: "/vault/photo.png", bytes: PNG_1PX });
+		} finally { off(); }
+		assert.deepEqual(stats, { nodes: 1, chains: 0 });
+		assert.equal(transcriberCalls, 1);
+		assert.equal(views.length, 1);
+		assert.ok(views[0]!.includes(TRANSCRIPTION), "the extractor prompt carries the transcription verbatim");
+		assert.deepEqual(phases, ["reading", "transcribing", "queued", "extracting", "waiting", "auditing", "merging"]);
+		const source = ledgers.readSources()[0]!;
+		assert.equal(source.id, id);
+		assert.equal(source.extractions?.length, 2, "one transcription record + one extraction record");
+		const [transcription, extraction] = source.extractions!;
+		assert.ok("transcriber" in transcription!.stages);
+		assert.equal(transcription!.stats, undefined);
+		assert.equal((transcription!.stages as { transcriber: { steps: unknown[]; model: string } }).transcriber.steps.length, 1);
+		assert.match((transcription!.stages as { transcriber: { model: string } }).transcriber.model, /^faux:/);
+		assert.ok(!("transcriber" in extraction!.stages));
+		assert.equal(extraction!.stats?.nodes, 1);
+		assert.ok(extraction!.startedAt > transcription!.startedAt);
+		assert.equal(extractionStatuses().length, 0);
+	});
+
+	it("no vision engine refuses with models_not_configured ['vision'] before any call or source write", async () => {
+		const ledgers = memoryLedgers();
+		let upserts = 0;
+		const graphStore = { ...ledgers, upsertSource: (s: NotesSource) => { upserts++; ledgers.upsertSource(s); } };
+		const { calls, extractor, auditor } = counted();
+		await assert.rejects(
+			createExtractionPipeline({ chatStore, graphStore, extractor, auditor }).importSource({ filePath: "/vault/x.png", bytes: PNG_1PX }),
+			(err) => err instanceof ModelsNotConfiguredError && JSON.stringify(err.envelope.missing) === JSON.stringify(["vision"]),
+		);
+		assert.deepEqual(calls, { extractor: 0, auditor: 0, transcriber: 0 });
+		assert.equal(upserts, 0);
+	});
+
+	it("cheap and vision both missing gather into one refusal", async () => {
+		const ledgers = memoryLedgers();
+		await assert.rejects(
+			createExtractionPipeline({ chatStore, graphStore: ledgers }).importSource({ filePath: "/vault/x.png", bytes: PNG_1PX }),
+			(err) => err instanceof ModelsNotConfiguredError && JSON.stringify(err.envelope.missing) === JSON.stringify(["cheap", "vision"]),
+		);
+		assert.equal(ledgers.readSources().length, 0);
+	});
+
+	it("a missing key for the vision tier refuses with ProviderKeyMissingError slots ['vision']", async () => {
+		const ledgers = memoryLedgers();
+		const { calls, extractor, auditor, transcriber } = counted();
+		await assert.rejects(
+			createExtractionPipeline({
+				chatStore, graphStore: ledgers, extractor, auditor, transcriber,
+				providerKeyMissing: (provider, tier) => (tier === "vision" ? providerKeyMissing(provider, [tier]) : null),
+			}).importSource({ filePath: "/vault/x.png", bytes: PNG_1PX }),
+			(err) => err instanceof ProviderKeyMissingError && JSON.stringify(err.envelope.slots) === JSON.stringify(["vision"]),
+		);
+		assert.deepEqual(calls, { extractor: 0, auditor: 0, transcriber: 0 });
+		assert.equal(ledgers.readSources().length, 0);
+	});
+
+	it("a vision engine without image input fails before any call or source write", async () => {
+		const ledgers = memoryLedgers();
+		const { calls, extractor, auditor } = counted();
+		const faux = createFauxCore({ models: [{ id: "text-only", input: ["text"] }] });
+		let visionCalls = 0;
+		faux.setResponses([() => { visionCalls++; return fauxAssistantMessage("x"); }]);
+		await assert.rejects(
+			createExtractionPipeline({ chatStore, graphStore: ledgers, extractor, auditor, transcriber: { model: faux.getModel(), streamFn: faux.streamSimple } })
+				.importSource({ filePath: "/vault/x.png", bytes: PNG_1PX }),
+			(err) => {
+				incomplete("failed")(err);
+				assert.match((err as Error).message, /^The vision model \(faux:text-only\) does not accept images/);
+				return true;
+			},
+		);
+		assert.equal(visionCalls, 0);
+		assert.deepEqual(calls, { extractor: 0, auditor: 0, transcriber: 0 });
+		assert.equal(ledgers.readSources().length, 0);
+	});
+
+	it("a rejected source (fake .pdf) fails with the core message and no source write", async () => {
+		const ledgers = memoryLedgers();
+		const { calls, extractor, auditor, transcriber } = counted();
+		await assert.rejects(
+			createExtractionPipeline({ chatStore, graphStore: ledgers, extractor, auditor, transcriber })
+				.importSource({ filePath: "/vault/fake.pdf", bytes: new TextEncoder().encode("not a pdf") }),
+			(err) => incomplete("failed")(err) && (err as Error).message === "This file is not a valid PDF.",
+		);
+		assert.deepEqual(calls, { extractor: 0, auditor: 0, transcriber: 0 });
+		assert.equal(ledgers.readSources().length, 0);
+	});
+
+	it("the same filename in flight is busy across the binary and text doors", async () => {
+		const ledgers = memoryLedgers();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const filePath = "/vault/shared-name";
+		const binary = createExtractionPipeline({
+			chatStore, graphStore: ledgers,
+			transcriber: fauxEngine([async () => { await gate; return fauxAssistantMessage(TRANSCRIPTION); }]),
+			extractor: submitModel("submit_findings", NOTES_FINDINGS), auditor: submitModel("submit_review", NOTES_VERDICT),
+		}).importSource({ filePath, bytes: PNG_1PX });
+		try {
+			await until(() => extractionStatuses().some((r) => r.chatId === srcIdOf(filePath) && r.phase === "transcribing"));
+			const other = counted();
+			const p = createExtractionPipeline({ chatStore, graphStore: ledgers, ...other });
+			await assert.rejects(p.importNotes({ filePath, text: NOTES_TEXT }), incomplete("busy"));
+			await assert.rejects(p.importSource({ filePath, bytes: new TextEncoder().encode(NOTES_TEXT) }), incomplete("busy"));
+			await assert.rejects(p.importSource({ filePath, bytes: PNG_1PX }), incomplete("busy"));
+			assert.deepEqual(other.calls, { extractor: 0, auditor: 0, transcriber: 0 });
+		} finally { release(); }
+		assert.deepEqual(await binary, { nodes: 1, chains: 0 });
+
+		// And the other way round: a text import in flight blocks the binary door.
+		let releaseText!: () => void;
+		const textGate = new Promise<void>((resolve) => { releaseText = resolve; });
+		const text = createExtractionPipeline({
+			chatStore, graphStore: ledgers,
+			extractor: gatedSubmitModel("submit_findings", NOTES_FINDINGS, textGate), auditor: submitModel("submit_review", NOTES_VERDICT),
+		}).importNotes({ filePath, text: NOTES_TEXT });
+		try {
+			await until(() => extractionStatuses().some((r) => r.chatId === srcIdOf(filePath) && r.phase === "extracting"));
+			await assert.rejects(createExtractionPipeline({ chatStore, graphStore: ledgers, ...counted() }).importSource({ filePath, bytes: PNG_1PX }), incomplete("busy"));
+		} finally { releaseText(); }
+		await text;
+	});
+
+	it("abortExtraction during transcription ends aborted and keeps the partial transcription usage", async () => {
+		const ledgers = memoryLedgers();
+		const filePath = "/vault/two-scans.pdf";
+		const id = srcIdOf(filePath);
+		let extractorCalls = 0;
+		const headless = {
+			available: () => true, unavailableReason: () => null,
+			runDemo: async () => { throw new Error("unused"); },
+			renderSvg: async () => { throw new Error("unused"); },
+			renderPdfPages: async (_p: string, pages: number[]) => pages.map((page) => ({ page, png: PNG_1PX })),
+		};
+		const pipeline = createExtractionPipeline({
+			chatStore, graphStore: ledgers, headless,
+			transcriber: fauxEngine([
+				() => fauxAssistantMessage("page one"),
+				async (_context, options) => {
+					// Wait until page 1's step billed, then abort the source.
+					await until(() => (extractionStatuses().find((r) => r.chatId === id)?.usage.transcriber?.steps.length ?? 0) === 1);
+					assert.equal(abortExtraction(id), true);
+					const sig = options?.signal;
+					if (!sig?.aborted) await new Promise((resolve) => sig?.addEventListener("abort", resolve, { once: true }));
+					return fauxAssistantMessage("late");
+				},
+			]),
+			extractor: submitModel("submit_findings", NOTES_FINDINGS, () => { extractorCalls++; }),
+			auditor: submitModel("submit_review", NOTES_VERDICT),
+		});
+		await assert.rejects(pipeline.importSource({ filePath, bytes: makePdf([null, null]) }), incomplete("aborted"));
+		assert.equal(extractorCalls, 0, "extraction never started");
+		const records = ledgers.readSources()[0]!.extractions ?? [];
+		assert.equal(records.length, 1);
+		assert.ok("transcriber" in records[0]!.stages);
+		assert.equal((records[0]!.stages as { transcriber: { steps: unknown[] } }).transcriber.steps.length, 1, "the billed page kept");
+		assert.equal(extractionStatuses().length, 0);
 	});
 });

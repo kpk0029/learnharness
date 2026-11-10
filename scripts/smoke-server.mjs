@@ -18,7 +18,13 @@
  * free port, NODE_ENV=production, a THROWAWAY LH_DATA_DIR and an EMPTY
  * LH_AUTH_FILE under os.tmpdir() (no real keys or data ever touch it) —
  * polls GET / until 200, then probes the GET-only API surface (graph /
- * models / settings — no side effects). Any non-200, an early server
+ * models / settings — no side effects), then two side-effect-free import
+ * POSTs (2026-11-02): a fake "probe.pdf" (plain-text bytes) must come back
+ * 200 with one failed "not a valid PDF" row, and a 12 MB "probe.png" of
+ * zeros must come back 200 (not 400 "unreadable upload") with one failed
+ * "not a valid PNG" row — proving the raised proxy body limit holds in the
+ * standalone build. Both are refused by magic-byte validation before any
+ * source record or model call. Any non-200, an early server
  * exit, or a 30s boot timeout fails the gate and prints the server's own
  * log tail for diagnosis. The child is ALWAYS killed before exit — a
  * leaked server holds its port against the next run (learned the hard
@@ -61,6 +67,26 @@ function freePort() {
 		srv.on("error", reject);
 	});
 }
+
+/** One multipart POST of a single file to /api/graph/import; resolves
+ *  { status, body } (status 0 = connection refused/failed). */
+async function postImport(url, name, bytes) {
+	const form = new FormData();
+	form.append("files", new Blob([bytes]), name);
+	try {
+		const res = await fetch(`${url}/api/graph/import`, { method: "POST", body: form, signal: AbortSignal.timeout(30_000) });
+		return { status: res.status, body: await res.json().catch(() => null) };
+	} catch {
+		return { status: 0, body: null };
+	}
+}
+
+/** The import probes: a rejection row must be failed and name the cause. */
+const IMPORT_PROBES = [
+	{ name: "probe.pdf", bytes: () => Buffer.from("plain text, not a PDF\n"), error: "not a valid PDF" },
+	// 12 MB — above Next's default 10 MB proxy body cap, under ours.
+	{ name: "probe.png", bytes: () => Buffer.alloc(12 * 1024 * 1024), error: "not a valid PNG" },
+];
 
 /** One GET; resolves the status code (0 = connection refused/failed). */
 function get(url) {
@@ -165,6 +191,18 @@ async function main() {
 			const status = await get(url + route);
 			if (status !== 200) throw new Error(`GET ${route} → ${status} (expected 200)`);
 			console.log(`[smoke-server] GET ${route} → 200`);
+		}
+
+		// 3) Import door: side-effect-free rejections (magic-byte checks run
+		// before any source record or model call).
+		for (const probe of IMPORT_PROBES) {
+			const { status, body } = await postImport(url, probe.name, probe.bytes());
+			if (status !== 200) throw new Error(`POST /api/graph/import (${probe.name}) → ${status} (expected 200): ${JSON.stringify(body)}`);
+			const row = body?.results?.length === 1 ? body.results[0] : null;
+			if (!row || row.outcome !== "failed" || typeof row.error !== "string" || !row.error.includes(probe.error)) {
+				throw new Error(`POST /api/graph/import (${probe.name}) → unexpected results ${JSON.stringify(body)} (expected one failed "${probe.error}" row)`);
+			}
+			console.log(`[smoke-server] POST /api/graph/import ${probe.name} → 200, failed "${row.error}"`);
 		}
 	} catch (err) {
 		failed = err;

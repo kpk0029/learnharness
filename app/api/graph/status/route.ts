@@ -2,7 +2,9 @@
  * GET /api/graph/status — the in-flight background extraction runs
  * (vision §1: the pipeline status must be visible on the home graph).
  * Thin transport over the pipeline's module-level registry: phase
- * (queued / extracting / waiting / auditing / merging) per job, oldest
+ * (reading / transcribing — the binary front door's conversion, owner
+ * 2026-11-02 — then queued / extracting / waiting / auditing / merging) per
+ * job, oldest
  * first — a multi-chunk source shows one row PER CHUNK ("· i/N" suffix,
  * per-chunk jobs, owner 2026-09-28). Titles joined from the chat store;
  * a missing chat record still reports the run.

@@ -114,6 +114,8 @@ export const extraction = createExtractionPipeline({
 	// role override → slot → NOTHING — read FRESH per stage call; an empty
 	// chain flows through as undefined and the pipeline refuses the run
 	// with the typed ModelsNotConfiguredError. Direct test values still win.
+	// The binary import door's "transcriber" (vision slot, owner 2026-11-02)
+	// resolves through this same chain.
 	engineFor: (role) =>
 		resolveEngine(role),
 	// Key-presence gate (provider-key interlude, 2026-09-25): same check

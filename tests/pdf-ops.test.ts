@@ -6,39 +6,22 @@
  *
  * pdfPageTexts (import front door, owner 2026-11-02): the fixture's pages
  * are single text runs with no hasEOL items, so the line-break pin uses a
- * tiny two-line PDF built in the test (multiLinePdf below).
+ * tiny two-line PDF built in memory (tests/fixtures/make-pdf.ts).
  */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { makePdf } from "./fixtures/make-pdf.ts";
 import { parsePageSpec, pdfExtract, pdfInfo, pdfPageTexts, pdfProbe, pdfSearch } from "../src/agent/subagents/pdf-ops.ts";
 
 const FIXTURE = path.join(import.meta.dirname, "fixtures", "sample-3page.pdf");
 
 /** A one-page PDF whose text sits on two separate lines (two Td moves), so
- *  pdfjs marks the first run hasEOL. Hand-built with a correct xref. */
+ *  pdfjs marks the first run hasEOL — the shared in-memory builder. */
 function multiLinePdf(): Buffer {
-	const stream = "BT /F1 12 Tf 72 720 Td (First line here) Tj 0 -20 Td (Second line here) Tj ET";
-	const objects = [
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
-		`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
-		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-	];
-	let body = "%PDF-1.4\n";
-	const offsets: number[] = [];
-	objects.forEach((obj, i) => {
-		offsets.push(body.length);
-		body += `${i + 1} 0 obj\n${obj}\nendobj\n`;
-	});
-	const xref = body.length;
-	body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
-	for (const off of offsets) body += `${String(off).padStart(10, "0")} 00000 n \n`;
-	body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
-	return Buffer.from(body, "latin1");
+	return makePdf(["First line here\nSecond line here"]);
 }
 
 describe("pdf-ops — the pdfjs text layer", () => {

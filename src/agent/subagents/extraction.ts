@@ -31,6 +31,9 @@ import { batchRuns, coverageOf, messageViewLines } from "../../core/coverage.ts"
 import { failedOutputCallIds, type LhMessage } from "../../core/native-messages.ts";
 import { auditorGraphTools } from "../tools/graph.ts";
 import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
+import type { HeadlessApi } from "./headless.ts";
+import { convertSource, detectSourceKind, SourceRejectedError } from "./source-conversion.ts";
+import type { SourceKind } from "../../core/source-import.ts";
 
 /**
  * The extraction pipeline (vision §1 construction, 2026-09-02 redesign;
@@ -97,6 +100,17 @@ import { runSubmitAgent, healStringifiedArrays } from "./submit-agent.ts";
  * source ids ("src_" + path hash) play the chatId role in mappings and
  * checkpoints, and the source record (graphStore sources seam) carries
  * the file path + the run's usage.
+ *
+ * THE BINARY FRONT DOOR (owner, 2026-11-02): importSource() takes the
+ * uploaded file's BYTES. Binary sources convert to text BEFORE the
+ * pipeline; the extractor stays format-blind. detectSourceKind classifies
+ * (text bytes go straight to importNotes); a PDF or image first passes the
+ * readiness gate for extractor + auditor + transcriber (the vision slot)
+ * and an image-capable check — both before any source record, temp file or
+ * model call — then converts (source-conversion.ts: pdfjs text layer,
+ * vision transcription for sparse pages; phases "reading" → "transcribing")
+ * and the text enters the SAME notes pipeline. Transcription spend is its
+ * own record kind in the source's usage log ({ stages: { transcriber } }).
  *
  * Observability (§5 baseline): every stage logs one line per step, its
  * start, and its duration; the pipeline logs a failure line before
@@ -614,8 +628,13 @@ function runAuditor(
  *  "waiting" (owner 2026-09-28): the serialized-audit gate — the job's
  *  audit+merge critical section is queued behind another job's; the
  *  extractor is done but the auditor may not start until the graph is
- *  stable. */
-export type ExtractionPhase = "queued" | "extracting" | "waiting" | "auditing" | "merging";
+ *  stable.
+ *  "reading" / "transcribing" (owner, 2026-11-02): the binary front door's
+ *  conversion, BEFORE "queued" — the PDF's text layer is being read, then
+ *  sparse pages (or an image) are being transcribed by the vision slot.
+ *  Full order: reading → transcribing → queued → extracting → waiting →
+ *  auditing → merging (text sources start at queued). */
+export type ExtractionPhase = "reading" | "transcribing" | "queued" | "extracting" | "waiting" | "auditing" | "merging";
 
 /** One in-flight pipeline run. Module-level: one process, one registry.
  *  Exported for the status payload's consumer typing (the dock). */
@@ -643,6 +662,8 @@ export interface RunningExtraction {
 	usage: {
 		extractor?: ExtractionStageUsage;
 		auditor?: ExtractionStageUsage;
+		/** The binary front door's conversion row (owner, 2026-11-02). */
+		transcriber?: ExtractionStageUsage;
 	};
 	/** True-cancellation handle (the dock's abort button): one controller per
 	 *  run, shared across phases; abort() cancels the in-flight model call. */
@@ -712,6 +733,8 @@ export interface ExtractionModels {
 	 *  engineFor chain (production wires no direct values). */
 	extractor?: PiEngine;
 	auditor?: PiEngine;
+	/** The binary front door's vision stage (owner, 2026-11-02). */
+	transcriber?: PiEngine;
 	/** Settings-resolved engine per role — the same slot treatment the
 	 *  job runner got, read FRESH per stage call (a settings PUT between
 	 *  stages lands). BYOK (owner, 2026-09-22): the chain (role override →
@@ -736,6 +759,11 @@ export interface ExtractionPipelineDeps extends GraphDeps, ExtractionModels {
 	 *  callers wire the live effective settings (extraction-UX redesign,
 	 *  2026-09-24). */
 	getChunkTokens?: () => number;
+	/** Test seam: the PDF renderer for vision-fallback pages (default: the
+	 *  headless module's own API). */
+	headless?: HeadlessApi;
+	/** Test seam: where conversion temp dirs are made (default os.tmpdir()). */
+	tmpRoot?: string;
 }
 
 export interface NotesImportInput {
@@ -744,6 +772,13 @@ export interface NotesImportInput {
 	filePath: string;
 	/** The file's raw content, VERBATIM — any format. */
 	text: string;
+}
+
+/** The binary front door's input (owner, 2026-11-02): the uploaded file's
+ *  name and its raw bytes — the pipeline classifies and converts. */
+export interface SourceImportInput {
+	filePath: string;
+	bytes: Uint8Array;
 }
 
 /** A notes import did not finish. Earlier graph writes and billed usage are
@@ -769,6 +804,10 @@ export interface ExtractionPipeline {
 	 *  path, so re-importing the same file re-runs extraction against the
 	 *  same source identity (mappings dedupe by it). */
 	importNotes(input: NotesImportInput): Promise<EmissionStats>;
+	/** The binary front door (owner, 2026-11-02): raw bytes in. Text bytes
+	 *  run importNotes; a PDF or image converts to text first (vision slot
+	 *  for sparse pages / images), then runs the same notes pipeline. */
+	importSource(input: SourceImportInput): Promise<EmissionStats>;
 }
 
 /** pi's per-step usage, flattened to the persisted CallUsage fields
@@ -801,19 +840,23 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 	 *  found unset (test values count as configured — they ARE engines),
 	 *  and whether a configured stage's provider key is gone (provider-key
 	 *  interlude, 2026-09-25) — both refuse BEFORE any batch runs. */
-	function refuseIfStagesUnready(): void {
-		const stages: readonly [ModelRole, PiEngine | undefined][] = [
-			["extractor", stageEngine("extractor", deps.extractor)],
-			["auditor", stageEngine("auditor", deps.auditor)],
-		];
+	function refuseIfStagesUnready(roles: readonly ModelRole[] = ["extractor", "auditor"]): void {
+		// The binary front door adds "transcriber" (owner, 2026-11-02): ALL
+		// missing slots gather into ONE refusal (cheap + vision together).
+		const overrides: Partial<Record<ModelRole, PiEngine | undefined>> = {
+			extractor: deps.extractor,
+			auditor: deps.auditor,
+			transcriber: deps.transcriber,
+		};
+		const stages = roles.map((role): [ModelRole, PiEngine | undefined] => [role, stageEngine(role, overrides[role])]);
 		const missing = new Set<ModelSlotName>();
 		for (const [role, engine] of stages) if (!engine) missing.add(ROLE_SLOT[role]);
 		if (missing.size > 0) {
 			console.info(`[extraction] refused — no model configured for: ${[...missing].join(", ")}`);
 			throw new ModelsNotConfiguredError([...missing]);
 		}
-		// Key-presence parity: first offender surfaces (extractor before
-		// auditor); fixing that key re-gates and the next run surfaces the
+		// Key-presence parity: first offender surfaces (in role order —
+		// extractor, auditor, transcriber); fixing that key re-gates and the next run surfaces the
 		// next offender, if any.
 		for (const [role, engine] of stages) {
 			const refusal = deps.providerKeyMissing?.(engine!.model.provider, ROLE_SLOT[role]);
@@ -863,7 +906,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 	}
 
 	/** Accumulate one billed step into the run's registry entry (live). */
-	function recordStep(jobKey: string, stage: "extractor" | "auditor", usage: CallUsage, model: string): void {
+	function recordStep(jobKey: string, stage: "extractor" | "auditor" | "transcriber", usage: CallUsage, model: string): void {
 		const run = runningExtractions.get(jobKey);
 		if (!run) return; // not running (tests driving stages directly)
 		run.usage[stage] ??= { model, steps: [] };
@@ -1036,6 +1079,22 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 		};
 		if (run.kind === "notes") graphStore.appendSourceUsage(run.chatId, entry);
 		else chatStore.appendExtractionUsage(run.chatId, entry);
+	}
+
+	/** The binary front door's conversion record (owner, 2026-11-02): its
+	 *  own record kind in the source's usage log — { stages: { transcriber } },
+	 *  no stats — appended success or failure, but only when at least one
+	 *  vision step was billed (a refusal or a text-layer-only PDF spent
+	 *  nothing). Idempotent per startedAt (the store dedupes). */
+	function persistTranscriptionUsage(id: string, startedAt: number, durationMs: number): void {
+		const transcriber = runningExtractions.get(id)?.usage.transcriber;
+		if (!transcriber || transcriber.steps.length === 0) return;
+		graphStore.appendSourceUsage(id, {
+			startedAt,
+			at: new Date().toISOString(),
+			durationMs,
+			stages: { transcriber },
+		});
 	}
 
 	/** One chunk/batch JOB (per-chunk jobs, owner 2026-09-28): the registry
@@ -1415,10 +1474,16 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 		}
 	}
 
+	/** The deterministic source id for a file path — the notes and binary
+	 *  front doors share it, so one file name is one source (and one lock). */
+	function sourceIdFor(filePath: string): string {
+		return `src_${crypto.createHash("sha256").update(filePath).digest("hex").slice(0, 12)}`;
+	}
+
 	/** Every explicit import processes the whole file. Identity, source digest,
 	 * auditor and usage history remain source-scoped; this is not exactly-once. */
 	async function importNotes(input: NotesImportInput): Promise<EmissionStats> {
-		const id = `src_${crypto.createHash("sha256").update(input.filePath).digest("hex").slice(0, 12)}`;
+		const id = sourceIdFor(input.filePath);
 		// Acquire BEFORE source upsert: overlapping contents must not alter metadata.
 		if (inFlight.has(id)) throw new NotesImportError("busy", { nodes: 0, chains: 0 }, "This file is already being imported. Try again when it finishes.");
 		inFlight.add(id);
@@ -1434,6 +1499,81 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
 		}
 	}
 
-	return { runExtraction, importNotes };
+	/** The binary front door (owner, 2026-11-02): classify the bytes; text
+	 *  runs importNotes verbatim, a PDF/image converts first (see the header). */
+	async function importSource(input: SourceImportInput): Promise<EmissionStats> {
+		const zero = (): EmissionStats => ({ nodes: 0, chains: 0 });
+		let kind: SourceKind;
+		try {
+			kind = detectSourceKind(input.filePath, input.bytes);
+		} catch (err) {
+			if (err instanceof SourceRejectedError) throw new NotesImportError("failed", zero(), err.message, { cause: err });
+			throw err;
+		}
+		// TextDecoder strips a UTF-8 BOM, exactly like Blob.text() did.
+		if (kind === "text") return importNotes({ filePath: input.filePath, text: new TextDecoder("utf-8").decode(input.bytes) });
+
+		const { filePath } = input;
+		const id = sourceIdFor(filePath);
+		// Same exclusion as importNotes — one lock per file name, both doors.
+		if (inFlight.has(id)) throw new NotesImportError("busy", zero(), "This file is already being imported. Try again when it finishes.");
+		inFlight.add(id);
+		try {
+			// D7: refuse BEFORE any source record, temp file or model call —
+			// the vision slot joins the extractor + auditor gate, then the
+			// vision model must actually accept images.
+			refuseIfStagesUnready(["extractor", "auditor", "transcriber"]);
+			const engine = stageEngine("transcriber", deps.transcriber)!;
+			if (!engine.model.input?.includes("image")) {
+				throw new NotesImportError("failed", zero(),
+					`The vision model (${engine.model.provider}:${engine.model.id}) does not accept images — choose an image-capable model for the vision slot.`);
+			}
+			const importedAt = new Date().toISOString();
+			graphStore.upsertSource({ id, filePath, importedAt });
+
+			let text: string;
+			setPhase(id, "reading", "notes", filePath);
+			const run = runningExtractions.get(id)!;
+			const t0 = performance.now();
+			try {
+				const converted = await convertSource({
+					filePath,
+					bytes: input.bytes,
+					kind,
+					engine,
+					headless: deps.headless,
+					tmpRoot: deps.tmpRoot,
+					signal: run.controller.signal,
+					onPhase: (phase) => setPhase(id, phase, "notes", filePath),
+					onStep: (usage, model) => recordStep(id, "transcriber", callUsage(usage), model),
+					gate: (fn) => withExtractSlot(id, fn),
+				});
+				text = converted.text;
+				console.info(
+					`[extraction ${id}] converted ${kind} (${filePath})` +
+						`${converted.pages === undefined ? "" : `, ${converted.pages} page(s)`}` +
+						`, ${converted.transcribedPages.length} transcribed in ${Math.round(performance.now() - t0)}ms`,
+				);
+			} catch (err) {
+				console.error(`[extraction ${id}] conversion failed (${Math.round(performance.now() - t0)}ms):`, err);
+				const aborted = err instanceof Error && err.name === "AbortError";
+				throw new NotesImportError(aborted ? "aborted" : "failed", zero(), err instanceof Error ? err.message : String(err), { cause: err });
+			} finally {
+				try {
+					persistTranscriptionUsage(id, run.startedAt, Math.round(performance.now() - t0));
+				} finally {
+					finishExtraction(id);
+				}
+			}
+			return await runNotesExtraction({ id, filePath, text, importedAt });
+		} catch (err) {
+			if (err instanceof NotesImportError || err instanceof ModelsNotConfiguredError || err instanceof ProviderKeyMissingError) throw err;
+			throw new NotesImportError("failed", zero(), err instanceof Error ? err.message : String(err), { cause: err });
+		} finally {
+			inFlight.delete(id);
+		}
+	}
+
+	return { runExtraction, importNotes, importSource };
 }
 

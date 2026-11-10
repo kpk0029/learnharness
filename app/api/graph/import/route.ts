@@ -12,9 +12,19 @@
  * pool keeps the run registry (the dock's status chips) and the ledgers
  * healthy. The dock's chips + graph refetch track progress live through
  * /api/graph/status, as with session runs.
+ *
+ * BYTES IN (owner, 2026-11-02): PDFs and images ride the same door. The
+ * route reads each file's raw bytes and hands them to
+ * extraction.importSource — the pipeline classifies (text / PDF / PNG /
+ * JPEG, size and page caps) and converts binary sources to text before
+ * extracting; every validation failure comes back as an ordinary failed
+ * row (no new error codes). Request-level guards: a declared body over
+ * MAX_IMPORT_REQUEST_BYTES is refused 413 before parsing, and a body that
+ * does not parse as multipart is a 400.
  */
 import { extraction, NotesImportError } from "@/src/server";
 import {
+	MAX_IMPORT_REQUEST_BYTES,
 	ModelsNotConfiguredError,
 	PROVIDER_KEY_MISSING_CODE,
 	ProviderKeyMissingError,
@@ -41,7 +51,15 @@ interface ImportResult {
 }
 
 export async function POST(request: Request) {
-	const form = await request.formData();
+	if (Number(request.headers.get("content-length")) > MAX_IMPORT_REQUEST_BYTES) {
+		return Response.json({ results: [] as ImportResult[], error: "request too large (over 100 MB)" }, { status: 413 });
+	}
+	let form: FormData;
+	try {
+		form = await request.formData();
+	} catch {
+		return Response.json({ results: [] as ImportResult[], error: "unreadable upload" }, { status: 400 });
+	}
 	const files = form.getAll("files").filter((f): f is File => f instanceof File);
 	if (files.length === 0) {
 		return Response.json({ results: [] as ImportResult[], error: "no files" }, { status: 400 });
@@ -55,8 +73,8 @@ export async function POST(request: Request) {
 			if (!next) return;
 			const { file, requestIndex } = next;
 			try {
-				const text = await file.text();
-				const stats = await extraction.importNotes({ filePath: file.name, text });
+				const bytes = new Uint8Array(await file.arrayBuffer());
+				const stats = await extraction.importSource({ filePath: file.name, bytes });
 				results.push({ filePath: file.name, requestIndex, outcome: "completed", ok: true, stats });
 			} catch (err) {
 				if (err instanceof ModelsNotConfiguredError) {
