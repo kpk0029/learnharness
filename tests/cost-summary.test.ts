@@ -44,6 +44,13 @@ const extractionRun = (
 	...(stats ? { stats } : {}),
 });
 
+const transcriptionRun = (startedAt: number, model: string, steps: CallUsage[] = [step(3000, 400)]): ExtractionRunUsage => ({
+	startedAt,
+	at: new Date(startedAt).toISOString(),
+	durationMs: 5_000,
+	stages: { transcriber: { model, steps } },
+});
+
 describe("graphCostSummary (the cost pill's fold)", () => {
 	test("folds both channels: stage totals, tokens, newest-first runs", () => {
 		// (The cluster-naming channel died with the extraction-UX close-out,
@@ -109,5 +116,83 @@ describe("graphCostSummary (the cost pill's fold)", () => {
 		assert.equal(empty.totalDollars, 0);
 		assert.equal(empty.runs.length, 0);
 		assert.equal(empty.stages.extraction.tokens.inputTokens, undefined);
+	});
+
+	test("no transcription records: stages.transcription is absent", () => {
+		const s = graphCostSummary({
+			chats: [{ title: "chat", extractions: [extractionRun(100, PRICED, PRICED)] }],
+			sources: [{ filePath: "/vault/x.md", extractions: [extractionRun(200, PRICED, PRICED)] }],
+		});
+		assert.equal("transcription" in s.stages, false);
+		assert.deepEqual(Object.keys(s.stages), ["extraction", "audit"]);
+	});
+
+	test("transcription records fold into stages.transcription: dollars, tokens, totals, run kind", () => {
+		const s = graphCostSummary({
+			chats: [],
+			sources: [{ filePath: "/vault/scan.pdf", extractions: [transcriptionRun(100, PRICED), transcriptionRun(150, PRICED)] }],
+		});
+		const trStep = callCost(step(3000, 400), PRICED)!;
+		assert.ok(s.stages.transcription);
+		assert.equal(s.stages.transcription.runs, 2);
+		assert.equal(s.stages.transcription.dollars, trStep * 2);
+		assert.equal(s.stages.transcription.unpricedRuns, 0);
+		assert.equal(s.stages.transcription.tokens.inputTokens, 6000);
+		assert.equal(s.stages.transcription.tokens.outputTokens, 800);
+		// No phantom extraction/audit stage-runs from a transcription record.
+		assert.equal(s.stages.extraction.runs, 0);
+		assert.equal(s.stages.audit.runs, 0);
+		assert.equal(s.stages.extraction.unpricedRuns, 0);
+		assert.equal(s.totalDollars, trStep * 2);
+		assert.deepEqual(s.runs.map((r) => r.kind), ["transcription", "transcription"]);
+		assert.equal(s.runs[0]!.dollars, trStep);
+		assert.equal(s.runs[0]!.tokens.inputTokens, 3000);
+		assert.equal(s.runs[0]!.merged, undefined);
+		assert.equal(s.unpricedRuns, 0);
+	});
+
+	test("unpriced transcription: excluded dollars, counted at stage and run level", () => {
+		const s = graphCostSummary({ chats: [], sources: [{ filePath: "/vault/a.png", extractions: [transcriptionRun(100, "unknown-model")] }] });
+		assert.equal(s.stages.transcription!.unpricedRuns, 1);
+		assert.equal(s.stages.transcription!.dollars, 0);
+		assert.equal(s.stages.transcription!.tokens.inputTokens, 3000, "tokens always sum");
+		assert.equal(s.runs[0]!.dollars, null);
+		assert.equal(s.unpricedRuns, 1);
+		assert.equal(s.totalDollars, 0);
+	});
+
+	test("subscription transcription: plan-billed, neither dollars nor unpriced", () => {
+		const s = graphCostSummary({ chats: [], sources: [{ filePath: "/vault/a.png", extractions: [transcriptionRun(100, "chatgpt:fixture")] }] });
+		assert.equal(s.stages.transcription!.subscriptionRuns, 1);
+		assert.deepEqual(s.stages.transcription!.subscriptionProviders, ["ChatGPT"]);
+		assert.equal(s.stages.transcription!.unpricedRuns, 0);
+		assert.equal(s.subscriptionRuns, 1);
+		assert.deepEqual(s.subscriptionProviders, ["ChatGPT"]);
+		assert.equal(s.runs[0]!.subscriptionRuns, 1);
+		assert.equal(s.runs[0]!.dollars, null);
+		assert.equal(s.unpricedRuns, 0, "a wholly plan-billed transcription run is not unpriced");
+	});
+
+	test("a source mixing both record kinds folds each into its own stages", () => {
+		const s = graphCostSummary({
+			chats: [{ title: "chat", extractions: [extractionRun(50, PRICED, PRICED)] }],
+			sources: [{ filePath: "/vault/scan.pdf", extractions: [transcriptionRun(100, PRICED), extractionRun(101, PRICED, "unknown-model", { nodes: 3, chains: 1 })] }],
+		});
+		const extStep = callCost(step(1000, 200), PRICED)!;
+		const audStep = callCost(step(2000, 100), PRICED)!;
+		const trStep = callCost(step(3000, 400), PRICED)!;
+		assert.equal(s.stages.extraction.runs, 2);
+		assert.equal(s.stages.audit.runs, 2);
+		assert.equal(s.stages.audit.unpricedRuns, 1);
+		assert.equal(s.stages.transcription!.runs, 1);
+		assert.equal(s.stages.transcription!.unpricedRuns, 0);
+		assert.equal(s.totalDollars, extStep * 2 + audStep + trStep);
+		assert.deepEqual(s.runs.map((r) => [r.kind, r.title]), [
+			["extraction", "/vault/scan.pdf"],
+			["transcription", "/vault/scan.pdf"],
+			["extraction", "chat"],
+		]);
+		assert.deepEqual(s.runs[0]!.merged, { nodes: 3, chains: 1 });
+		assert.equal(s.unpricedRuns, 0);
 	});
 });

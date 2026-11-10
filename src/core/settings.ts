@@ -64,7 +64,7 @@ export interface RoleModelOverride {
 /** The capability tiers a user can pin models into (owner-settled mapping):
  *  strong = prober + teacher (also the per-session default-teacher
  *  starting point); cheap = researcher, demo-builder, extractor, auditor,
-; vision = visual-maker + pdf-reader. Resolution per role:
+; vision = visual-maker + pdf-reader + transcriber. Resolution per role:
  *  ROLE OVERRIDE → slot → factory pin. */
 export const MODEL_SLOTS = ["strong", "cheap", "vision"] as const;
 export type ModelSlotName = (typeof MODEL_SLOTS)[number];
@@ -226,6 +226,7 @@ export const ROLE_SLOT: Readonly<Record<ModelRole, ModelSlotName>> = {
 	auditor: "cheap",
 	visualMaker: "vision",
 	pdfReader: "vision",
+	transcriber: "vision",
 };
 
 /** General settings — app-level behavior. Version DISPLAY and plans login

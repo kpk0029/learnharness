@@ -16,6 +16,7 @@ import { describe, it } from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { GraphChromeRow } from "../components/graph-view.tsx";
+import { NOTES_IMPORT_HINT } from "../src/core/source-import.ts";
 import type { GraphRenderSettings } from "../components/graph-canvas.ts";
 
 /** Ref doubles — the SSR harness never attaches them. */
@@ -38,6 +39,7 @@ describe("GraphChromeRow — the empty-graph ruling (owner, 2026-09-25)", () => 
 	it("EMPTY graph: Import Notes renders (the entry point), search + settings absent", () => {
 		const html = renderToStaticMarkup(createElement(GraphChromeRow, { ...PROPS, isEmpty: true }));
 		assert.ok(html.includes('data-testid="import-notes"'));
+		assert.ok(html.includes('accept=".md,.markdown,.txt,.pdf,.png,.jpg,.jpeg"'), "PDFs + images join notes (owner, 2026-11-02)");
 		assert.ok(html.includes("Import notes…"));
 		assert.ok(!html.includes("Search nodes…"), "search is a lie on an empty graph");
 		// the settings gear is the lucide-settings svg (tooltip wave: its old
@@ -50,6 +52,8 @@ describe("GraphChromeRow — the empty-graph ruling (owner, 2026-09-25)", () => 
 	it("POPULATED graph: all four render, the gated trio carries the fade", () => {
 		const html = renderToStaticMarkup(createElement(GraphChromeRow, { ...PROPS, isEmpty: false }));
 		assert.ok(html.includes('data-testid="import-notes"'));
+		assert.ok(html.includes('accept=".md,.markdown,.txt,.pdf,.png,.jpg,.jpeg"'), "PDFs + images join notes (owner, 2026-11-02)");
+		assert.ok(html.includes("Import notes…"), "the label stays Import notes…");
 		assert.ok(html.includes("Search nodes…"));
 		assert.ok(html.includes("lucide-settings"), "the settings gear renders");
 		assert.ok(html.includes('data-testid="open-chain-table"'), "the chains entry renders");
@@ -66,5 +70,9 @@ describe("GraphChromeRow — the empty-graph ruling (owner, 2026-09-25)", () => 
 			createElement(GraphChromeRow, { ...PROPS, isEmpty: false, query: "zzz", noMatch: false }),
 		);
 		assert.ok(!quiet.includes("No matching nodes."));
+	});
+
+	it("the import hint names PDFs and images (owner, 2026-11-02)", () => {
+		assert.equal(NOTES_IMPORT_HINT, "Import notes, PDFs, or images into the graph");
 	});
 });

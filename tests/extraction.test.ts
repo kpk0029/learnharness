@@ -906,6 +906,7 @@ describe("the extraction pipeline (extractor → auditor → merger)", () => {
 		assert.equal(record.extractions?.length, 1);
 		const run = record.extractions![0]!;
 		assert.equal(run.stats?.nodes, 1); // p2 created; p1 linked, not created
+		assert.ok(!("transcriber" in run.stages), "an extraction record, not a transcription one");
 		// the scripted engine's model, provider-qualified (model slots wave)
 		assert.equal(run.stages.extractor.model, "faux:faux-1");
 		assert.equal(run.stages.extractor.steps.length, 1); // the submit call — the run STOPS after a clean submit
@@ -955,6 +956,7 @@ describe("the extraction pipeline (extractor → auditor → merger)", () => {
 		assert.equal(record.extractions?.length, 1);
 		const run = record.extractions![0]!;
 		assert.equal(run.stats, undefined);
+		assert.ok(!("transcriber" in run.stages), "an extraction record, not a transcription one");
 		assert.equal(run.stages.extractor.steps.length, 0);
 		assert.equal(run.stages.auditor.steps.length, 0);
 
@@ -1517,7 +1519,9 @@ describe("the notes front door (importNotes — format-agnostic)", () => {
 		assert.ok(Date.parse(source.importedAt));
 		assert.equal(source.extractions?.length, 1, "the run's usage persisted into the source record");
 		assert.equal(source.extractions![0]!.stats?.nodes, 1);
-		assert.ok(source.extractions![0]!.stages.extractor.steps.length > 0, "faux usage captured");
+		const sourceStages = source.extractions![0]!.stages;
+		assert.ok(!("transcriber" in sourceStages), "an extraction record, not a transcription one");
+		assert.ok(sourceStages.extractor.steps.length > 0, "faux usage captured");
 
 		// File-scoped provenance (submit-schema slim, 2026-09-28): the
 		// node carries ONE chat-level point — the source key itself, no

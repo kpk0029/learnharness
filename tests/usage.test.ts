@@ -112,3 +112,25 @@ test("appendSourceUsage: idempotent; reimport keeps history; absent source is a 
 		else fs.rmSync(SOURCES_FILE, { force: true });
 	}
 });
+
+test("appendSourceUsage: a transcription record round-trips intact beside an extraction record", () => {
+	fs.mkdirSync(PATHS.graph, { recursive: true });
+	const backup = fs.existsSync(SOURCES_FILE) ? fs.readFileSync(SOURCES_FILE) : undefined;
+	try {
+		const id = "src_usagetest02";
+		const transcription: ExtractionRunUsage = {
+			startedAt: 1, at: "2026-11-02T00:00:00Z", durationMs: 9_000,
+			stages: { transcriber: { model: "openai:gpt-5", steps: [call({ inputTokens: 1500, outputTokens: 300, cacheWrite1hTokens: 0 })] } },
+		};
+		graphStore.upsertSource({ id, filePath: "/fixture/scan.pdf", importedAt: "2026-11-02T00:00:00Z" });
+		graphStore.appendSourceUsage(id, transcription);
+		graphStore.appendSourceUsage(id, runEntry(2));
+		const back = graphStore.readSources().find((s) => s.id === id)?.extractions;
+		assert.deepEqual(back, JSON.parse(JSON.stringify([transcription, runEntry(2)])));
+		assert.equal("stats" in back![0]!, false, "transcription records carry no stats");
+		assert.ok("transcriber" in back![0]!.stages);
+	} finally {
+		if (backup) fs.writeFileSync(SOURCES_FILE, backup);
+		else fs.rmSync(SOURCES_FILE, { force: true });
+	}
+});

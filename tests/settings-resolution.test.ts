@@ -203,6 +203,8 @@ describe("the slot tier (BYOK, owner 2026-09-22)", () => {
 			models: { vision: { model: { provider: "zai", id: "v" }, thinkingLevel: "low" } },
 		};
 		assert.deepEqual(resolveRoleSpec("pdfReader", visionRecord), { provider: "zai", id: "v", thinkingLevel: "low" });
+		// transcriber (binary import front door) rides the same vision slot
+		assert.deepEqual(resolveRoleSpec("transcriber", visionRecord), { provider: "zai", id: "v", thinkingLevel: "low" });
 		assert.equal(resolveRoleSpec("teacher", null), undefined);
 	});
 });

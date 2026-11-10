@@ -65,6 +65,7 @@
 
 import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { NotesImportErrors, useNotesImport } from "@/components/notes-import.tsx";
+import { NOTES_IMPORT_ACCEPT, NOTES_IMPORT_HINT } from "@/src/core";
 import Link from "next/link";
 import { FileTextIcon, ListTreeIcon, Loader2Icon, SearchIcon, SettingsIcon, UploadIcon, WaypointsIcon } from "lucide-react";
 import { incrementalLayout, propositionSessionHref, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
@@ -302,7 +303,11 @@ function graphProviders(value: { subscriptionRuns?: number; subscriptionProvider
 	return value.subscriptionProviders ?? ((value.subscriptionRuns ?? 0) > 0 ? ["ChatGPT"] : []);
 }
 function graphUsageLabel(costs: Pick<GraphCostSummary, "stages">): string {
-	const stages = [costs.stages.extraction, costs.stages.audit];
+	const stages = [
+		costs.stages.extraction,
+		costs.stages.audit,
+		...(costs.stages.transcription ? [costs.stages.transcription] : []),
+	];
 	const providers = [...new Set(stages.flatMap(graphProviders))];
 	const priced = stages.some((stage) => stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0);
 	const dollars = displayCostTotals(costs).totalDollars;
@@ -316,7 +321,8 @@ function graphUsageLabel(costs: Pick<GraphCostSummary, "stages">): string {
  * spend) is deliberately not shown anywhere: the pill and the panel must
  * agree, and both read THIS, never GraphCostSummary.totalDollars.
  * (The core fold's naming stage was then culled outright — 2026-09-24 —
- * so the recent-runs list carries extraction runs only.)
+ * so the recent-runs list carries extraction runs only.) Binary-import
+ * transcription (owner, 2026-11-02) joins the sum when present.
  */
 export function displayCostTotals(costs: Pick<GraphCostSummary, "stages">): {
 	totalDollars: number;
@@ -324,9 +330,11 @@ export function displayCostTotals(costs: Pick<GraphCostSummary, "stages">): {
 } {
 	// The two live stages (the spine came and went on one day,
 	// 2026-09-30 — digest-aware extraction replaced it).
+	// Transcription (binary imports) joins only when present.
+	const transcription = costs.stages.transcription;
 	return {
-		totalDollars: costs.stages.extraction.dollars + costs.stages.audit.dollars,
-		unpricedRuns: costs.stages.extraction.unpricedRuns + costs.stages.audit.unpricedRuns,
+		totalDollars: costs.stages.extraction.dollars + costs.stages.audit.dollars + (transcription?.dollars ?? 0),
+		unpricedRuns: costs.stages.extraction.unpricedRuns + costs.stages.audit.unpricedRuns + (transcription?.unpricedRuns ?? 0),
 	};
 }
 
@@ -382,10 +390,11 @@ export function GraphCostControl({ costs }: { costs: GraphCostSummary }) {
  * not tracked anymore — the headline sums the displayed stages only and
  * naming-kind runs never reach the list.
  */
-function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
+export function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 	const stageRows: [string, GraphCostSummary["stages"]["extraction"]][] = [
 		["Extraction", costs.stages.extraction],
 		["Audit", costs.stages.audit],
+		...(costs.stages.transcription ? [["Transcription", costs.stages.transcription] as [string, GraphCostSummary["stages"]["extraction"]]] : []),
 	];
 	// The displayed figures come from displayCostTotals (naming excluded —
 	// the pill and this panel must agree).
@@ -426,6 +435,9 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 							<span className="min-w-0 flex-1 truncate text-muted-foreground">
 								<span className="text-foreground/70">{timeAgo(run.startedAt)}</span>{" "}
 								{run.title}
+								{run.kind === "transcription" && (
+									<span className="text-muted-foreground"> · transcription</span>
+								)}
 								{run.merged && (
 									<span className="text-muted-foreground">
 										{" "}
@@ -433,7 +445,7 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 									</span>
 								)}
 							</span>
-							<span className="shrink-0 tabular-nums">{fmtRunCost(run.dollars, graphProviders(run))}{run.dollars === null && run.subscriptionRuns === 1 ? " +1 unpriced" : ""}</span>
+							<span className="shrink-0 tabular-nums">{fmtRunCost(run.dollars, graphProviders(run))}{run.kind === "extraction" && run.dollars === null && run.subscriptionRuns === 1 ? " +1 unpriced" : ""}</span>
 						</div>
 					))}
 			</div>
@@ -918,7 +930,7 @@ export function GraphChromeRow({
 					ref={fileInputRef}
 					type="file"
 					multiple
-					accept=".md,.markdown,.txt"
+					accept={NOTES_IMPORT_ACCEPT}
 					className="hidden"
 					onChange={(e) => {
 						onImportFiles(e.target.files);
@@ -928,8 +940,9 @@ export function GraphChromeRow({
 				<Hint
 					// The one button whose action isn't obvious from its label:
 					// the missing fact is where imports go (owner, subtlety
-					// round 2026-09-25).
-					label="Import notes into the graph"
+					// round 2026-09-25). PDFs + images join notes (owner,
+					// 2026-11-02): the shared hint lives in src/core/source-import.ts.
+					label={NOTES_IMPORT_HINT}
 					side="bottom"
 				>
 					<button

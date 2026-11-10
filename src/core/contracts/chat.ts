@@ -96,7 +96,14 @@ export interface ExtractionStageUsage {
 /** One finished (or failed mid-flight) extraction run's usage record.
  *  Appended to the chat's `extractions` log when the run ends — success or
  *  failure, because money was spent either way; `stats` is present only
- *  when the merger actually ran. */
+ *  when the merger actually ran.
+ *
+ *  Two record kinds share the log (owner, 2026-11-02): extraction records
+ *  carry `stages: { extractor, auditor }`; transcription records carry
+ *  `stages: { transcriber }` and are written by the binary import front
+ *  door (PDF/image → Markdown) before extraction runs — they have no
+ *  `stats` field. Readers narrow with `"transcriber" in run.stages`.
+ *  Existing on-disk records are unchanged (additive). */
 export interface ExtractionRunUsage {
 	/** The run's registry startedAt (ms) — the idempotency key. */
 	startedAt: number;
@@ -106,10 +113,9 @@ export interface ExtractionRunUsage {
 	stats?: EmissionStats;
 	/** Model usage per stage, in pipeline order (merger is deterministic —
 	 *  no model call, no entry). */
-	stages: {
-		extractor: ExtractionStageUsage;
-		auditor: ExtractionStageUsage;
-	};
+	stages:
+		| { extractor: ExtractionStageUsage; auditor: ExtractionStageUsage }
+		| { transcriber: ExtractionStageUsage };
 }
 
 // ─── Usage accounting (the money channel) ─────────────────────────────────────
