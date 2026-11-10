@@ -118,6 +118,10 @@ export const extraction = createExtractionPipeline({
 	// resolves through this same chain.
 	engineFor: (role) =>
 		resolveEngine(role),
+	// Chunk budget (R7, owner 2026-11-10): read FRESH per run so the user's
+	// graph.extractionChunkTokens applies to both front doors — until now
+	// only the CLI wired it and the app always used the factory 4096.
+	getChunkTokens: () => effectiveSettings().graph.extractionChunkTokens,
 	// Key-presence gate (provider-key interlude, 2026-09-25): same check
 	// the job runner gets — a stage engine whose provider key is gone
 	// refuses BEFORE any batch runs (the typed throw), never mid-run.
