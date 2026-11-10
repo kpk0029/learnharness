@@ -49,6 +49,10 @@ export interface RenderSvgOptions {
 export interface RenderPdfOptions {
 	/** Render DPI — 72 is 100% zoom; the skill's guidance is 100/150/200. */
 	dpi?: number;
+	/** Cap on the rendered page's longest edge in pixels (owner, 2026-11-02:
+	 *  vision-fallback pages for the import front door). The dpi scale is
+	 *  clamped per page so neither side exceeds it; absent = dpi alone. */
+	maxEdgePx?: number;
 }
 
 export interface RenderedPdfPage {
@@ -495,7 +499,13 @@ async function renderPdfPages(
 		for (const pageNo of pages) {
 			if (pageNo < 1 || pageNo > doc.numPages) continue;
 			const pg = await doc.getPage(pageNo);
-			const vp = pg.getViewport({ scale: dpi / 72 });
+			let scale = dpi / 72;
+			if (opts.maxEdgePx !== undefined) {
+				const base = pg.getViewport({ scale: 1 });
+				const longest = Math.max(base.width, base.height);
+				if (longest > 0) scale = Math.min(scale, opts.maxEdgePx / longest);
+			}
+			const vp = pg.getViewport({ scale });
 			const canvas = createCanvas(Math.ceil(vp.width), Math.ceil(vp.height));
 			const ctx = canvas.getContext("2d");
 			// pdfjs's render types speak the DOM context; @napi-rs/canvas's
@@ -516,6 +526,43 @@ async function renderPdfPages(
 	} finally {
 		await loadingTask.destroy().catch(() => {});
 	}
+}
+
+// ─── Image normalization for vision (import front door) ──────────
+
+/** Decode a PNG/JPEG and re-encode it with its long edge ≤ maxEdgePx
+ *  (default 2000) for the transcriber's vision model. Always re-encodes,
+ *  even when already within the limit — that normalises odd encodings.
+ *
+ *  (owner, 2026-11-02) Uses @napi-rs/canvas — the Skia package pdfjs's
+ *  Node integration already loads for renderPdfPages — honouring the "one
+ *  native image lib per process; app code carries none" rule documented on
+ *  providerSafePng: no additional native image library. */
+export async function normalizeImageForVision(
+	bytes: Uint8Array,
+	kind: "png" | "jpeg",
+	opts: { maxEdgePx?: number } = {},
+): Promise<{ data: Buffer; mimeType: "image/png" | "image/jpeg" }> {
+	const maxEdgePx = opts.maxEdgePx ?? 2000;
+	const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+	let img: Awaited<ReturnType<typeof loadImage>>;
+	try {
+		img = await loadImage(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+	} catch {
+		throw new Error("This image could not be read.");
+	}
+	if (!(img.width > 0 && img.height > 0)) throw new Error("This image could not be read.");
+	const ratio = Math.min(1, maxEdgePx / Math.max(img.width, img.height));
+	const width = Math.max(1, Math.round(img.width * ratio));
+	const height = Math.max(1, Math.round(img.height * ratio));
+	const canvas = createCanvas(width, height);
+	canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+	if (kind === "png") {
+		return { data: providerSafePng(canvas.toBuffer("image/png")), mimeType: "image/png" };
+	}
+	// @napi-rs/canvas's JPEG quality is on Skia's 0–100 scale (verified
+	// 2026-11-10: 0.9 encodes like ~1), so "≈0.9" is 90 here.
+	return { data: canvas.toBuffer("image/jpeg", 90), mimeType: "image/jpeg" };
 }
 
 // ─── the real API ────────────────────────────────────────────────────────────

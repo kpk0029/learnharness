@@ -3,13 +3,43 @@
  * (tests/fixtures/sample-3page.pdf: 3 pages, distinct subjects, "force" on
  * page 2 only). The render path (headless Chrome) is covered by the
  * pdf-reader loop tests via the headlessOverride fake.
+ *
+ * pdfPageTexts (import front door, owner 2026-11-02): the fixture's pages
+ * are single text runs with no hasEOL items, so the line-break pin uses a
+ * tiny two-line PDF built in the test (multiLinePdf below).
  */
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { parsePageSpec, pdfExtract, pdfInfo, pdfProbe, pdfSearch } from "../src/agent/subagents/pdf-ops.ts";
+import { parsePageSpec, pdfExtract, pdfInfo, pdfPageTexts, pdfProbe, pdfSearch } from "../src/agent/subagents/pdf-ops.ts";
 
 const FIXTURE = path.join(import.meta.dirname, "fixtures", "sample-3page.pdf");
+
+/** A one-page PDF whose text sits on two separate lines (two Td moves), so
+ *  pdfjs marks the first run hasEOL. Hand-built with a correct xref. */
+function multiLinePdf(): Buffer {
+	const stream = "BT /F1 12 Tf 72 720 Td (First line here) Tj 0 -20 Td (Second line here) Tj ET";
+	const objects = [
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+		`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	];
+	let body = "%PDF-1.4\n";
+	const offsets: number[] = [];
+	objects.forEach((obj, i) => {
+		offsets.push(body.length);
+		body += `${i + 1} 0 obj\n${obj}\nendobj\n`;
+	});
+	const xref = body.length;
+	body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+	for (const off of offsets) body += `${String(off).padStart(10, "0")} 00000 n \n`;
+	body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+	return Buffer.from(body, "latin1");
+}
 
 describe("pdf-ops — the pdfjs text layer", () => {
 	it("pdfInfo triages every page (count, text lengths, image counts, math density)", async () => {
@@ -55,6 +85,52 @@ describe("pdf-ops — the pdfjs text layer", () => {
 		await pdfProbe(FIXTURE); // resolves
 		const garbage = path.join(import.meta.dirname, "fixtures", "not-a-pdf.txt");
 		await assert.rejects(() => pdfProbe(garbage));
+	});
+
+	it("pdfProbe resolves with the page count", async () => {
+		assert.deepEqual(await pdfProbe(FIXTURE), { page_count: 3 });
+	});
+
+	it("pdfPageTexts reads every page with pdfInfo's exact per-page fields", async () => {
+		const [texts, info] = await Promise.all([pdfPageTexts(FIXTURE), pdfInfo(FIXTURE)]);
+		assert.equal(texts.page_count, 3);
+		assert.equal(texts.pages.length, 3);
+		assert.deepEqual(
+			texts.pages.map(({ page, text_length, image_count, math_density }) => ({ page, text_length, image_count, math_density })),
+			info.pages,
+		);
+	});
+
+	it("pdfPageTexts page text carries the same words pdfExtract returns", async () => {
+		const texts = await pdfPageTexts(FIXTURE);
+		const words = (s: string) => s.split(/\s+/).filter(Boolean);
+		for (const p of texts.pages) {
+			const extracted = (await pdfExtract(FIXTURE, String(p.page))).replace(/^--- Page \d+ ---\n/, "");
+			assert.deepEqual(words(p.text), words(extracted), `page ${p.page} words`);
+		}
+	});
+
+	it("pdfPageTexts keeps line breaks (hasEOL → newline)", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lh-pdf-ops-"));
+		try {
+			const file = path.join(dir, "two-lines.pdf");
+			fs.writeFileSync(file, multiLinePdf());
+			const { page_count, pages } = await pdfPageTexts(file);
+			assert.equal(page_count, 1);
+			assert.ok(pages[0]!.text.includes("\n"), `line break kept: ${JSON.stringify(pages[0]!.text)}`);
+			assert.match(pages[0]!.text, /First line here\s*\n\s*Second line here/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("pdfPageTexts rejects an already-aborted signal with an AbortError", async () => {
+		const ctrl = new AbortController();
+		ctrl.abort();
+		await assert.rejects(
+			() => pdfPageTexts(FIXTURE, { signal: ctrl.signal }),
+			(err: unknown) => err instanceof Error && err.name === "AbortError",
+		);
 	});
 
 	it("parsePageSpec: all / ranges / lists / clamping", () => {

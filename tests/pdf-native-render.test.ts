@@ -5,12 +5,17 @@
  * scaling arithmetic (scale = dpi/72), out-of-range page skipping, and the
  * Skia canvas actually being exercised (not a DOM canvas — none exists in
  * this process).
+ *
+ * Import front door (owner 2026-11-02): the maxEdgePx clamp on renders and
+ * normalizeImageForVision (decode + bounded re-encode through the same Skia
+ * package) are pinned here too.
  */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { realHeadless } from "../src/agent/subagents/headless.ts";
+import { createCanvas } from "@napi-rs/canvas";
+import { normalizeImageForVision, realHeadless } from "../src/agent/subagents/headless.ts";
 import { standardFontsDir } from "../src/agent/subagents/pdf-ops.ts";
 
 const FIXTURE = path.join(import.meta.dirname, "fixtures", "sample-3page.pdf");
@@ -80,5 +85,49 @@ describe("native pdf_render (pdfjs paints, @napi-rs/canvas hosts)", () => {
 		// renderPdfPages touches pdfjs + @napi-rs/canvas and nothing else.
 		const pages = await realHeadless.renderPdfPages(FIXTURE, [1], { dpi: 72 });
 		assert.equal(pages.length, 1);
+	});
+
+	it("maxEdgePx clamps both rendered dimensions", async () => {
+		const pages = await realHeadless.renderPdfPages(FIXTURE, [1, 2, 3], { dpi: 150, maxEdgePx: 300 });
+		assert.equal(pages.length, 3);
+		for (const p of pages) {
+			const { w, h } = pngFacts(p.png);
+			assert.ok(w <= 300 && h <= 300, `page ${p.page} is ${w}×${h}`);
+			assert.ok(Math.max(w, h) >= 290, `clamped to the cap, not below it (${w}×${h})`);
+		}
+	});
+});
+
+describe("normalizeImageForVision (Skia decode + bounded re-encode)", () => {
+	function widePng(): Buffer {
+		const canvas = createCanvas(3000, 1000);
+		const ctx = canvas.getContext("2d");
+		ctx.fillStyle = "#fff";
+		ctx.fillRect(0, 0, 3000, 1000);
+		ctx.fillStyle = "#c00";
+		ctx.fillRect(100, 100, 800, 400);
+		return canvas.toBuffer("image/png");
+	}
+
+	it("downscales a 3000×1000 PNG to a 2000px long edge, PNG out", async () => {
+		const out = await normalizeImageForVision(widePng(), "png");
+		assert.equal(out.mimeType, "image/png");
+		const { w, h, idats } = pngFacts(out.data);
+		assert.equal(Math.max(w, h), 2000);
+		assert.ok(Math.abs(h - 667) <= 1, `aspect kept (${w}×${h})`);
+		assert.equal(idats, 1, "providerSafePng canonical form");
+	});
+
+	it("JPEG kind re-encodes as JPEG", async () => {
+		const out = await normalizeImageForVision(widePng(), "jpeg");
+		assert.equal(out.mimeType, "image/jpeg");
+		assert.equal(out.data.subarray(0, 2).toString("hex"), "ffd8", "JPEG SOI marker");
+	});
+
+	it("garbage bytes reject with the user-facing message", async () => {
+		await assert.rejects(
+			() => normalizeImageForVision(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]), "png"),
+			{ message: "This image could not be read." },
+		);
 	});
 });

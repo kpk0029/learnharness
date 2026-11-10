@@ -18,6 +18,12 @@ import { fileURLToPath } from "node:url";
  *
  * These are pure library functions — no model in sight. The pdf-reader
  * agent (pdf-reader.ts) drives them through its own tool loop.
+ *
+ * (owner, 2026-11-02) The binary import front door ("Import notes…" with a
+ * PDF) reads whole PDFs through pdfPageTexts: one pass, pdfInfo's per-page
+ * triage fields plus the page text with its line breaks kept (pdfjs hasEOL
+ * → "\n"), so the extractor's line-based chunker can split pages. pdfInfo
+ * and pdfPageTexts share readPage so their numbers never drift.
  */
 
 export interface PdfPageInfo {
@@ -27,6 +33,12 @@ export interface PdfPageInfo {
 	/** Fraction of math-flavored chars — the render-this-page signal (port
 	 *  of the skill's unicode-range density heuristic). */
 	math_density: number;
+}
+
+/** One page as the import front door reads it: pdfInfo's triage fields
+ *  plus the EOL-preserving text. */
+export interface PdfPageText extends PdfPageInfo {
+	text: string;
 }
 
 export interface PdfInfo {
@@ -59,6 +71,9 @@ async function openDocument(filePath: string) {
 	// workerSrc needed); teardown is the loading task's destroy().
 	// verbosity 0 = errors only — scanned PDFs (JBIG2 XObjects) otherwise
 	// flood the log with per-page warnings (live-smoke finding 2026-09-19).
+	// isEvalSupported (approved hardening, 2026-11-02) is NOT passed: the
+	// option no longer exists in pdfjs-dist 6.x (absent from its getDocument
+	// types and build) — font paths there never eval.
 	const task = pdfjs.getDocument({ data, standardFontDataUrl: standardFontsDir(), verbosity: 0 });
 	return { doc: await task.promise, task };
 }
@@ -70,6 +85,20 @@ function itemsToText(items: unknown[]): string {
 		if (it && typeof it === "object" && "str" in (it as Record<string, unknown>)) {
 			const str = (it as { str?: unknown }).str;
 			if (typeof str === "string") out += str;
+		}
+	}
+	return out;
+}
+
+/** Like itemsToText, but a "\n" follows every item pdfjs marks hasEOL —
+ *  the line structure the extractor's chunker splits on. */
+function itemsToLines(items: unknown[]): string {
+	let out = "";
+	for (const it of items) {
+		if (it && typeof it === "object" && "str" in (it as Record<string, unknown>)) {
+			const { str, hasEOL } = it as { str?: unknown; hasEOL?: unknown };
+			if (typeof str === "string") out += str;
+			if (hasEOL === true) out += "\n";
 		}
 	}
 	return out;
@@ -99,42 +128,86 @@ function mathDensity(text: string): number {
 
 /** Cheap validity probe: getDocument resolves only for parseable PDFs —
  *  no page walk, no text extraction (unlike pdfInfo). The reader's upfront
- *  unreadable-source gate; garbage files throw pdfjs's precise error. */
-export async function pdfProbe(filePath: string): Promise<void> {
-	const { task } = await openDocument(filePath);
+ *  unreadable-source gate; garbage files throw pdfjs's precise error.
+ *  Resolves with the page count (the import front door's page cap). */
+export async function pdfProbe(filePath: string): Promise<{ page_count: number }> {
+	const { doc, task } = await openDocument(filePath);
+	const page_count = doc.numPages;
 	await task.destroy();
+	return { page_count };
+}
+
+type PdfDocument = Awaited<ReturnType<typeof openDocument>>["doc"];
+type PdfOps = Awaited<ReturnType<typeof loadPdfjs>>["OPS"];
+
+/** One page's triage signals (+ both text forms) — the single body pdfInfo
+ *  and pdfPageTexts share, so their numbers never drift. text_length and
+ *  math_density are measured on the itemsToText form, exactly as before. */
+async function readPage(doc: PdfDocument, pageNumber: number, OPS: PdfOps): Promise<PdfPageInfo & { flat: string; lines: string }> {
+	const page = await doc.getPage(pageNumber);
+	const content = await page.getTextContent();
+	const items = content.items as unknown[];
+	const text = itemsToText(items);
+	// count page images: paintImageXObject ops in the operator list
+	const ops = await page.getOperatorList();
+	let imageCount = 0;
+	for (const fn of ops.fnArray) {
+		if (fn === OPS.paintImageXObject) imageCount++;
+	}
+	return {
+		page: pageNumber,
+		text_length: text.length,
+		image_count: imageCount,
+		math_density: Math.round(mathDensity(text) * 10000) / 10000,
+		flat: text,
+		lines: itemsToLines(items),
+	};
 }
 
 /** pdf_info: page count + per-page triage signals. ALWAYS run first. */
 export async function pdfInfo(filePath: string): Promise<PdfInfo> {
 	const pdfjs = await loadPdfjs(); // OPS constant for the operator-list scan
-	const { doc } = await openDocument(filePath);
-	const pages: PdfPageInfo[] = [];
-	let totalText = 0;
-	for (let i = 1; i <= doc.numPages; i++) {
-		const page = await doc.getPage(i);
-		const content = await page.getTextContent();
-		const text = itemsToText(content.items as unknown[]);
-		// count page images: paintImageXObject ops in the operator list
-		const ops = await page.getOperatorList();
-		let imageCount = 0;
-		for (const fn of ops.fnArray) {
-			if (fn === pdfjs.OPS.paintImageXObject) imageCount++;
+	const { doc, task } = await openDocument(filePath);
+	try {
+		const pages: PdfPageInfo[] = [];
+		let totalText = 0;
+		for (let i = 1; i <= doc.numPages; i++) {
+			const { page, text_length, image_count, math_density } = await readPage(doc, i, pdfjs.OPS);
+			totalText += text_length;
+			pages.push({ page, text_length, image_count, math_density });
 		}
-		totalText += text.length;
-		pages.push({
-			page: i,
-			text_length: text.length,
-			image_count: imageCount,
-			math_density: Math.round(mathDensity(text) * 10000) / 10000,
-		});
+		return {
+			path: filePath,
+			page_count: doc.numPages,
+			mean_text_length: Math.round(totalText / Math.max(doc.numPages, 1)),
+			pages,
+		};
+	} finally {
+		await task.destroy().catch(() => {});
 	}
-	return {
-		path: filePath,
-		page_count: doc.numPages,
-		mean_text_length: Math.round(totalText / Math.max(doc.numPages, 1)),
-		pages,
-	};
+}
+
+/** Whole-PDF read for the import front door: every page in order, pdfInfo's
+ *  per-page fields plus the text with line breaks kept. Abortable between
+ *  pages (signal.throwIfAborted — an AbortError-named DOMException). */
+export async function pdfPageTexts(
+	filePath: string,
+	opts?: { signal?: AbortSignal },
+): Promise<{ page_count: number; pages: PdfPageText[] }> {
+	opts?.signal?.throwIfAborted();
+	const pdfjs = await loadPdfjs();
+	const { doc, task } = await openDocument(filePath);
+	try {
+		const pages: PdfPageText[] = [];
+		for (let i = 1; i <= doc.numPages; i++) {
+			opts?.signal?.throwIfAborted();
+			const { page, text_length, image_count, math_density, lines } = await readPage(doc, i, pdfjs.OPS);
+			pages.push({ page, text_length, image_count, math_density, text: lines });
+		}
+		return { page_count: doc.numPages, pages };
+	} finally {
+		await task.destroy().catch(() => {});
+	}
 }
 
 /** Parse 'all' | '1-5' | '1,3,7' | '3' into a sorted 1-indexed page list. */
