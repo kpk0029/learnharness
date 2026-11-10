@@ -209,7 +209,15 @@ provenance remains readable/searchable but belongs to no birth session.
   present to find the exact source message. Empty message IDs in older data are
   chat-level attribution; they do not identify an exact message.
 - Imported notes use `src_…` source IDs. `sources.json` supplies `id`, `filePath`,
-  and `importedAt`; these source paths are references only.
+  and `importedAt`; these source paths are references only. A source can be a
+  text file, a PDF, or a PNG/JPEG image; the path's extension tells the kind
+  (there is no kind field). PDFs and images were converted to text at import
+  and the originals discarded, so the path may no longer point at anything.
+- A source's `extractions` log mixes two usage-record kinds. Extraction records
+  have `stages.extractor` and `stages.auditor` (and `stats` when the merge ran).
+  Transcription records, written before extraction for PDF/image imports, have
+  only `stages.transcriber` and never `stats`. Both are model spend, not
+  learning evidence. An older record may carry `contentFp`; it is ignored.
 - Missing/deleted source metadata can leave a valid graph. The session index then
   uses the source ID as its label and `file` as its fallback kind; this fallback
   alone does not prove the source was an imported file.

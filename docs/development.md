@@ -112,7 +112,7 @@ flowchart TB
 ## Layout
 
 ```
-app/                            Next.js App Router — pages + 16 thin API route handlers
+app/                            Next.js App Router — pages + 32 thin API route handlers
 components/                     session + home UI, question dock, plan panel, graph
                                 canvas + view, artifact renderers (registry: artifacts/),
                                 dictation, activity dock, keyboard machine

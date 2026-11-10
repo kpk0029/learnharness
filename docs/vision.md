@@ -62,8 +62,17 @@ saw rendered text, never ChatRecord JSON), so the notes path needs only a
 second extractor prompt (general-purpose extraction; the understanding word
 judges the **author's** grasp from their own commentary) and a source
 abstraction: each imported file becomes a `NotesSource` record (deterministic
-id from the path hash — re-imports are idempotent), playing the `chatId` role
+id from the path hash, so a re-import lands on the same source; every
+explicit import re-extracts the whole file — the 2026 ruling recorded on
+`NotesSource` in `src/core/contracts/graph.ts`), playing the `chatId` role
 in mappings, checkpoints, and observation events.
+
+**PDFs and images (owner, 2026-11-02):** "anything textual" now includes PDFs
+and PNG/JPEG images, converted to text BEFORE the pipeline: a PDF's pdfjs text
+layer page by page, with sparse-text pages and every image transcribed to
+Markdown by the vision slot. The extractor still only ever sees text. Originals
+are discarded after conversion; provenance stays the static file path. Limits:
+25 MB per file, 100 pages per PDF.
 
 Decided edges:
 
